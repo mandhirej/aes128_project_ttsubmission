@@ -29,10 +29,14 @@ module mixcolumns_one_column (
 
     assign col_out = {m0, m1, m2, m3};
 
-	function automatic [7:0] xtime(input [7:0] b);
-        begin
-            xtime = (b[7]) ? ((b << 1) ^ 8'h1b) : (b << 1);
-        end
-    endfunction
-	 
+	 function [7:0] xtime;
+		input [7:0] b;
+		begin
+			if (b[7] == 1'b1)
+				xtime = (b << 1) ^ 8'h1b;
+			else
+				xtime = (b << 1);
+		end
+	 endfunction
+		
 endmodule 
