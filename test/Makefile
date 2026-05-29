@@ -13,7 +13,10 @@ ifneq ($(GATES),yes)
 # RTL simulation:
 SIM_BUILD				= sim_build/rtl
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
-
+VERILOG_SOURCES += $(PWD)/../src/sbox.sv
+VERILOG_SOURCES += $(PWD)/../src/subbytes_shiftrows.sv
+VERILOG_SOURCES += $(PWD)/../src/mixcolumns.sv
+VERILOG_SOURCES += $(PWD)/../src/key_expansion.sv
 else
 
 # Gate level simulation:
