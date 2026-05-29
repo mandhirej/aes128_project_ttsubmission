@@ -1,15 +1,15 @@
 // =============================================================================
-// tt_um_aes128_skychip_final.sv  –  Primary AES-128 Accelerator Core
+// aes128_alt1.sv  –  Primary AES-128 Accelerator Core
 //
 // Design choices (primary / baseline design):
-//   Criterion 1 – Partially Unrolled 2-round design
-//                 Two full AES rounds are computed per clock cycle by
-//                 duplicating the SubBytes/ShiftRows/MixColumns/AddRoundKey
-//                 datapath. 10 rounds → 5 active cycles instead of 10.
+//   Criterion 1 – Iterative 1-Round-Per-Cycle Design
+//                 A single set of AES round logic (SubBytes, ShiftRows, 
+//                 MixColumns, AddRoundKey) is reused across 10 cycles. 
+//                 This minimizes chip area for the Tiny Tapeout backend.
 //
 //   Criterion 2 – 16-bit Serial Loading Wrapper Interface
-//                 To fit within the limited I/O pins of Tiny Tapeout, the
-//                 128-bit Key and Plaintext are shifted in 16 bits at a time 
+//                 To maximize throughput over the limited Tiny Tapeout I/O,
+//                 the 128-bit Key and Plaintext are shifted in 16 bits at a time 
 //                 over 8 clock cycles each. The resulting 128-bit Ciphertext 
 //                 is similarly shifted out 16 bits at a time over 8 cycles.
 //
@@ -22,10 +22,11 @@
 //   Cycles 0-7:   ST_LOAD_KEY state. 128-bit CipherKey is loaded 16 bits/cycle.
 //   Cycles 8-15:  ST_LOAD_PT state. 128-bit Plaintext is loaded 16 bits/cycle.
 //                 On Cycle 15, the Initial AddRoundKey (Round 0) is applied.
-//   Cycles 16-20: ST_PROCESS state. 2 AES rounds are computed per cycle.
-//                 Cycle 20 processes Rounds 9 and 10 (MixColumns bypassed in R10).
-//   Cycles 21-28: ST_UNLOAD state. 128-bit Ciphertext is shifted out 16 bits/cycle.
-//                 (Cycle 28 completes unloading and loops back to ST_LOAD_PT).
+//   Cycles 16-24: ST_MAIN_ROUND state. 1 standard AES round is computed per cycle
+//                 (Rounds 1 through 9).
+//   Cycle 25:     ST_FINAL_ROUND state. Round 10 is computed (MixColumns bypassed).
+//   Cycles 26-33: ST_UNLOAD state. 128-bit Ciphertext is shifted out 16 bits/cycle.
+//                 (Cycle 33 completes unloading and loops back to ST_LOAD_PT).
 //
 // Interface:
 //   clk, rst_n    – Standard synchronous clock / active-low reset
@@ -58,11 +59,12 @@ module tt_um_aes128_skychip_final (
     // -------------------------------------------------------------------------
     // FSM States
     // -------------------------------------------------------------------------
-    typedef enum logic [1:0] {
-        ST_LOAD_KEY = 2'd0,  // 8 cycles: Load 128-bit key
-        ST_LOAD_PT  = 2'd1,  // 8 cycles: Load 128-bit plaintext
-        ST_PROCESS  = 2'd2,  // 5 cycles: 2 AES rounds per cycle (10 rounds total)
-        ST_UNLOAD   = 2'd3   // 8 cycles: Shift out 128-bit ciphertext
+    typedef enum logic [2:0] {
+        ST_LOAD_KEY,   // 8 cycles: Load 128-bit key
+        ST_LOAD_PT,    // 8 cycles: Load 128-bit plaintext
+        ST_MAIN_ROUND, // 9 cycles: AES rounds 1-9
+        ST_FINAL_ROUND,// 1 cycle : AES round 10
+        ST_UNLOAD      // 8 cycles: Shift out 128-bit ciphertext
     } state_t;
 
     state_t state;
@@ -71,35 +73,26 @@ module tt_um_aes128_skychip_final (
     logic [127:0] key_reg;   // Holds initial key, then expanded round keys
 
     // -------------------------------------------------------------------------
-    // Partially Unrolled AES Datapath Logic (2 Rounds)
+    // AES Datapath Logic
     // -------------------------------------------------------------------------
-    
-    // --- STAGE 1: Odd Rounds (1, 3, 5, 7, 9) ---
-    logic [127:0] sb_sr_1_out, mix_1_out, key_1_out, rk_1_out;
-    
-    subbytes_shiftrows sb_sr_1 (.data_in(state_reg),   .data_out(sb_sr_1_out));
-    mixcolumns              mix_1   (.data_in(sb_sr_1_out), .data_out(mix_1_out));
-    key_expansion      ke_1    (.prev_key(key_reg),    .round(count), .next_key(key_1_out));
-    
-    assign rk_1_out = mix_1_out ^ key_1_out; // End of Stage 1
+    logic [127:0] sb_sr_out, mix_out, next_key_out;
 
-    // --- STAGE 2: Even Rounds (2, 4, 6, 8, 10) ---
-    logic [127:0] sb_sr_2_out, mix_2_out, key_2_out, rk_2_out;
+    subbytes_shiftrows sb_sr_inst (.data_in(state_reg), .data_out(sb_sr_out));
+    mixcolumns         mix_inst    (.data_in(sb_sr_out), .data_out(mix_out));
     
-    subbytes_shiftrows sb_sr_2 (.data_in(rk_1_out),    .data_out(sb_sr_2_out));
-    mixcolumns              mix_2   (.data_in(sb_sr_2_out), .data_out(mix_2_out));
-    key_expansion      ke_2    (.prev_key(key_1_out),  .round(count + 4'd1), .next_key(key_2_out));
-    
-    // Round 10 Bypass Logic: MixColumns is skipped in the very last round of AES.
-    // When count == 9, Stage 2 is processing Round 10.
-    wire is_round_10 = (count == 4'd9);
-    assign rk_2_out = (is_round_10 ? sb_sr_2_out : mix_2_out) ^ key_2_out;
+    // Note: round for key_expansion needs to be the round we are MOVING TO.
+    // In Load_PT (final cycle), we prep Round 0. In Main Rounds, we prep next.
+    key_expansion key_exp (
+        .prev_key(key_reg), 
+        .round(count), 
+        .next_key(next_key_out)
+    );
 
     // -------------------------------------------------------------------------
     // Control & Shift Logic
     // -------------------------------------------------------------------------
     wire [15:0] bus_in = {uio_in, ui_in};
-    wire _unused = &{ena, 1'b0};
+	 wire _unused = &{ena, 1'b0};
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -111,7 +104,7 @@ module tt_um_aes128_skychip_final (
             case (state)
                 // 1. Load 128-bit Key (16 bits x 8 cycles)
                 ST_LOAD_KEY: begin
-                    key_reg <= {key_reg[111:0], bus_in}; 
+                    key_reg <= {key_reg[111:0], bus_in}; // 16 new bits + 112 old bits = 128 bits
                     if (count == 4'd7) begin
                         count <= 4'd0;
                         state <= ST_LOAD_PT;
@@ -124,8 +117,8 @@ module tt_um_aes128_skychip_final (
                 ST_LOAD_PT: begin
                     state_reg <= {state_reg[111:0], bus_in};
                     if (count == 4'd7) begin
-                        count <= 4'd1; // Setup to start Round 1
-                        state <= ST_PROCESS;
+                        count <= 4'd1; // Setup for Round 1
+                        state <= ST_MAIN_ROUND;
                         // Initial Round XOR (Round 0) happens during transition
                         state_reg <= {state_reg[111:0], bus_in} ^ key_reg;
                     end else begin
@@ -133,23 +126,27 @@ module tt_um_aes128_skychip_final (
                     end
                 end
 
-                // 3. Process 2 Rounds per Cycle (5 cycles total)
-                ST_PROCESS: begin
-                    // Commit the result of the 2-round combinational path
-                    state_reg <= rk_2_out;
-                    key_reg   <= key_2_out;
-                    
+                // 3. Perform Main Rounds (1-9)
+                ST_MAIN_ROUND: begin
+                    key_reg   <= next_key_out;
+                    state_reg <= mix_out ^ next_key_out;
                     if (count == 4'd9) begin
-                        // Reached Round 10, encryption is complete
-                        count <= 4'd0;
-                        state <= ST_UNLOAD;
+                        count <= 4'd10;
+                        state <= ST_FINAL_ROUND;
                     end else begin
-                        // Advance round counter by 2 (e.g., 1 -> 3 -> 5 -> 7 -> 9)
-                        count <= count + 4'd2;
+                        count <= count + 4'd1;
                     end
                 end
 
-                // 4. Unload Ciphertext (16 bits x 8 cycles)
+                // 4. Final Round (Round 10 - No MixColumns)
+                ST_FINAL_ROUND: begin
+                    key_reg   <= next_key_out;
+                    state_reg <= sb_sr_out ^ next_key_out;
+                    state     <= ST_UNLOAD;
+                    count     <= 4'd0;
+                end
+
+                // 5. Unload Ciphertext (16 bits x 8 cycles)
                 ST_UNLOAD: begin
                     state_reg <= {state_reg[111:0], 16'h0};
                     if (count == 4'd7) begin
@@ -172,5 +169,5 @@ module tt_um_aes128_skychip_final (
     // Use MSB of state_reg for the 16-bit output bus
     assign uio_out = state_reg[127:120]; 
     assign uo_out  = state_reg[119:112];
-	 
+
 endmodule 
